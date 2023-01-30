@@ -1,0 +1,19 @@
+[package]
+name = "echo-server"
+version = "0.0.1"
+rust-version = "1.61"
+edition = "2021"
+
+[[bin]]
+name = "echo-server"
+path = "src/main/rust/main.rs"
+
+[dependencies]
+clap = { version = "4.1", features = ["derive"]}
+env_logger = "0.9"
+libc = "0.2"
+log = "0.4"
+socket2 = "0.4.7"
+warp = "0.3.2"
+tokio = { version = "1.0", features = ["net", "rt-multi-thread", "macros", "signal"]}
+tokio-stream = { version = "0.1.11", features = ["net"]}

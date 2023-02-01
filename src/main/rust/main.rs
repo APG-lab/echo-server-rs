@@ -32,8 +32,10 @@ fn port_in_range (s: &str)
 // based on https://github.com/stackabletech/secret-operator/pull/26/files
 mod bind_private
 {
+    #[cfg(not(target_vendor="apple"))]
     use libc;
     use socket2::{self,Socket};
+    #[cfg(not(target_vendor="apple"))]
     use std::os::unix::prelude::AsRawFd;
     use std::path;
     use tokio;
@@ -42,11 +44,13 @@ mod bind_private
     pub fn uds_bind_private (path: impl AsRef<path::Path>) -> Result<tokio::net::UnixListener, std::io::Error> {
         // Workaround for https://github.com/tokio-rs/tokio/issues/4422
         let socket = Socket::new (socket2::Domain::UNIX, socket2::Type::STREAM, None)?;
+	#[cfg(not(target_vendor="apple"))]
         unsafe {
             // Socket-level chmod is propagated to the file created by Socket::bind.
             // We need to chmod /before/ creating the file, because otherwise there is a brief window where
             // the file is world-accessible (unless restricted by the global umask).
-            if libc::fchmod (socket.as_raw_fd (), 0o600) == -1 {
+            if libc::fchmod (socket.as_raw_fd (), libc::S_IRUSR | libc::S_IWUSR) == -1
+            {
                 return Err (std::io::Error::last_os_error ());
             }
         }

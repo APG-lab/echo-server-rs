@@ -146,40 +146,39 @@ pub fn socket_activation_pong (handle: &tokio::runtime::Handle, tx_cancel: tokio
     });
 }
 
-pub fn socket_activation_proxy (handle: &tokio::runtime::Handle, socket_file_path: &str)
+pub fn socket_activation_proxy (handle: &tokio::runtime::Handle, socket_file_path: &str, tx_cancel: tokio::sync::broadcast::Sender<()>)
 {
     handle.block_on (async move {
         // SAFETY: no other functions should call `from_raw_fd`, so there
         // is only one owner for the file descriptor.
         let ul = unsafe { net::TcpListener::from_raw_fd (3) };
-        match ul.accept ()
-        {
-            Ok ((us_active, _socket_address)) => {
-                debug! ("ul accepted connection");
-                match tokio::net::TcpStream::from_std (us_active)
-                {
-                    Ok (mut ts_active) => {
-                        debug! ("obtained tokio stream active");
-                        match tokio::net::UnixStream::connect (socket_file_path).await
-                        {
-                            Ok (mut ts_uds) => {
-                                debug! ("obtained tokio stream uds");
-                                match tokio::io::copy_bidirectional (&mut ts_active, &mut ts_uds).await
-                                {
-                                    Ok ((ab, ba)) => { debug! ("bytes ab: {} bytes ba: {}", ab, ba); },
-                                    Err (e) => { debug! ("ts stream copy error: {:?}", e); }
-                                }
-                            },
-                            Err (e) => { debug! ("Error connecting tokio stream uds: {:?}", e); }
-                        }
-                        debug! ("Shutdown");
-                    },
-                    Err (e) => {
-                        debug! ("Error creating tokio stream active: {:?}", e);
+
+        match async {
+            let mut rx_shutdown = tx_cancel.subscribe ();
+            ul.set_nonblocking (true)?;
+            let tl = tokio::net::TcpListener::from_std (ul)?;
+            loop {
+                match tokio::select! {
+                    _ = rx_shutdown.recv () => { Err ("Got crl-c") },
+                    rs = tl.accept () => {
+                        let (mut ts_active, _socket_address) = rs?;
+                        let mut ts_uds = tokio::net::UnixStream::connect (socket_file_path).await?;
+                        debug! ("obtained tokio stream uds");
+                        let (ab, ba) = tokio::io::copy_bidirectional (&mut ts_active, &mut ts_uds).await?;
+                        debug! ("bytes ab: {} bytes ba: {}", ab, ba);
+                        Ok (())
                     }
                 }
-            },
-            Err (e) => { debug! ("Error accepting ul: {:?}", e); }
+                {
+                    Ok (_) => {},
+                    Err (e) => { debug! ("Accept loop shutdown: {:?}", e);break; }
+                }
+            }
+            Result::Ok::<(), helper::PublicError> (())
+        }.await
+        {
+            Ok (_) => {},
+            Err (e) => { debug! ("Failed to proxy: {:?}", e); }
         }
     });
 }
@@ -305,7 +304,7 @@ fn main ()
     match args.command
     {
         Commands::ActivationPong => socket_activation_pong (rt.handle (), tx),
-        Commands::ActivationProxyUnix { socket_file_path } => socket_activation_proxy (rt.handle (), &socket_file_path),
+        Commands::ActivationProxyUnix { socket_file_path } => socket_activation_proxy (rt.handle (), &socket_file_path, tx),
         Commands::TcpProxyUnix { host, port, socket_file_path } => tcp_proxy (rt.handle (), &host, port, &socket_file_path, tx),
         Commands::UnixPong { socket_file_path } => unix_pong (rt.handle (), &socket_file_path, tx)
     }

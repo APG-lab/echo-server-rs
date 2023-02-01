@@ -5,12 +5,29 @@ use std::env;
 use std::fs;
 use std::io;
 use std::net;
+use std::ops;
 use std::os::fd::FromRawFd;
 use std::os::unix;
 use std::time;
 use tokio;
 use tokio_stream;
 use warp::{self,Filter};
+
+const PORT_RANGE: ops::RangeInclusive<usize> = 1..=65535;
+
+fn port_in_range (s: &str)
+    -> Result<u16, String>
+{
+    let port: usize = s.parse ().map_err (|_| format!("`{}` isn't a port number", s))?;
+    if PORT_RANGE.contains(&port)
+    {
+        Ok(port as u16)
+    }
+    else
+    {
+        Err (format! ("port not in range {}-{}", PORT_RANGE.start (), PORT_RANGE.end ()))
+    }
+}
 
 // based on https://github.com/stackabletech/secret-operator/pull/26/files
 mod bind_private
@@ -141,6 +158,49 @@ pub fn socket_activation_proxy (handle: &tokio::runtime::Handle, socket_file_pat
     });
 }
 
+// Its blocking so hangs the program on ctl-c and only accepts one connection, but hopefully it
+// will do for now
+pub fn tcp_proxy (handle: &tokio::runtime::Handle, host: &str, port: u16, socket_file_path: &str)
+{
+    handle.block_on (async move {
+        match net::TcpListener::bind ((host, port))
+        {
+            Ok (ul) => {
+                match ul.accept ()
+                {
+                    Ok ((us_active, _socket_address)) => {
+                        debug! ("ul accepted connection");
+                        match tokio::net::TcpStream::from_std (us_active)
+                        {
+                            Ok (mut ts_active) => {
+                                debug! ("obtained tokio stream active");
+                                match tokio::net::UnixStream::connect (socket_file_path).await
+                                {
+                                    Ok (mut ts_uds) => {
+                                        debug! ("obtained tokio stream uds");
+                                        match tokio::io::copy_bidirectional (&mut ts_active, &mut ts_uds).await
+                                        {
+                                            Ok ((ab, ba)) => { debug! ("bytes ab: {} bytes ba: {}", ab, ba); },
+                                            Err (e) => { debug! ("ts stream copy error: {:?}", e); }
+                                        }
+                                    },
+                                    Err (e) => { debug! ("Error connecting tokio stream uds: {:?}", e); }
+                                }
+                                debug! ("Shutdown");
+                            },
+                            Err (e) => {
+                                debug! ("Error creating tokio stream active: {:?}", e);
+                            }
+                        }
+                    },
+                    Err (e) => { debug! ("Error accepting ul: {:?}", e); }
+                }
+            },
+            Err (e) => { debug! ("Error binding {}:{} {:?}", host, port, e); }
+        }
+    });
+}
+
 pub fn unix_pong (handle: &tokio::runtime::Handle, socket_file_path: &str, tx_cancel: tokio::sync::broadcast::Sender<()>)
 {
     handle.block_on (async move {
@@ -179,6 +239,12 @@ pub fn unix_pong (handle: &tokio::runtime::Handle, socket_file_path: &str, tx_ca
 enum Commands {
     ActivationPong,
     ActivationProxyUnix {
+        socket_file_path: String
+    },
+    TcpProxyUnix {
+        host: String,
+        #[arg(value_parser = port_in_range)]
+        port: u16,
         socket_file_path: String
     },
     UnixPong {
@@ -220,6 +286,7 @@ fn main ()
     {
         Commands::ActivationPong => socket_activation_pong (rt.handle (), tx),
         Commands::ActivationProxyUnix { socket_file_path } => socket_activation_proxy (rt.handle (), &socket_file_path),
+        Commands::TcpProxyUnix { host, port, socket_file_path } => tcp_proxy (rt.handle (), &host, port, &socket_file_path),
         Commands::UnixPong { socket_file_path } => unix_pong (rt.handle (), &socket_file_path, tx)
     }
     debug! ("Shutting down");

@@ -29,6 +29,28 @@ fn port_in_range (s: &str)
     }
 }
 
+mod helper
+{
+    use std::io;
+    use thiserror::Error;
+
+    #[derive(Error, Debug)]
+    pub enum PublicError
+    {
+        #[error("IOError: {0}")]
+        IOError (io::Error)
+    }
+
+    impl From<io::Error> for PublicError
+    {
+        fn from (err: io::Error)
+        -> PublicError
+        {
+            PublicError::IOError (err)
+        }
+    }
+}
+
 // based on https://github.com/stackabletech/secret-operator/pull/26/files
 mod bind_private
 {
@@ -167,40 +189,21 @@ pub fn socket_activation_proxy (handle: &tokio::runtime::Handle, socket_file_pat
 pub fn tcp_proxy (handle: &tokio::runtime::Handle, host: &str, port: u16, socket_file_path: &str)
 {
     handle.block_on (async move {
-        match net::TcpListener::bind ((host, port))
+        match async {
+            let ul = net::TcpListener::bind ((host, port))?;
+            let (us_active, _socket_address) = ul.accept ()?;
+            debug! ("ul accepted connection");
+            let mut ts_active = tokio::net::TcpStream::from_std (us_active)?;
+            debug! ("obtained tokio stream active");
+            let mut ts_uds = tokio::net::UnixStream::connect (socket_file_path).await?;
+            debug! ("obtained tokio stream uds");
+            let (ab, ba) = tokio::io::copy_bidirectional (&mut ts_active, &mut ts_uds).await?;
+            debug! ("bytes ab: {} bytes ba: {}", ab, ba);
+            Result::Ok::<(), helper::PublicError> (())
+        }.await
         {
-            Ok (ul) => {
-                match ul.accept ()
-                {
-                    Ok ((us_active, _socket_address)) => {
-                        debug! ("ul accepted connection");
-                        match tokio::net::TcpStream::from_std (us_active)
-                        {
-                            Ok (mut ts_active) => {
-                                debug! ("obtained tokio stream active");
-                                match tokio::net::UnixStream::connect (socket_file_path).await
-                                {
-                                    Ok (mut ts_uds) => {
-                                        debug! ("obtained tokio stream uds");
-                                        match tokio::io::copy_bidirectional (&mut ts_active, &mut ts_uds).await
-                                        {
-                                            Ok ((ab, ba)) => { debug! ("bytes ab: {} bytes ba: {}", ab, ba); },
-                                            Err (e) => { debug! ("ts stream copy error: {:?}", e); }
-                                        }
-                                    },
-                                    Err (e) => { debug! ("Error connecting tokio stream uds: {:?}", e); }
-                                }
-                                debug! ("Shutdown");
-                            },
-                            Err (e) => {
-                                debug! ("Error creating tokio stream active: {:?}", e);
-                            }
-                        }
-                    },
-                    Err (e) => { debug! ("Error accepting ul: {:?}", e); }
-                }
-            },
-            Err (e) => { debug! ("Error binding {}:{} {:?}", host, port, e); }
+            Ok (_) => {},
+            Err (e) => { debug! ("Failed to proxy: {:?}", e); }
         }
     });
 }

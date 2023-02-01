@@ -186,19 +186,32 @@ pub fn socket_activation_proxy (handle: &tokio::runtime::Handle, socket_file_pat
 
 // Its blocking so hangs the program on ctl-c and only accepts one connection, but hopefully it
 // will do for now
-pub fn tcp_proxy (handle: &tokio::runtime::Handle, host: &str, port: u16, socket_file_path: &str)
+pub fn tcp_proxy (handle: &tokio::runtime::Handle, host: &str, port: u16, socket_file_path: &str, tx_cancel: tokio::sync::broadcast::Sender<()>)
 {
     handle.block_on (async move {
         match async {
+            let mut rx_shutdown = tx_cancel.subscribe ();
             let ul = net::TcpListener::bind ((host, port))?;
-            let (us_active, _socket_address) = ul.accept ()?;
-            debug! ("ul accepted connection");
-            let mut ts_active = tokio::net::TcpStream::from_std (us_active)?;
-            debug! ("obtained tokio stream active");
-            let mut ts_uds = tokio::net::UnixStream::connect (socket_file_path).await?;
-            debug! ("obtained tokio stream uds");
-            let (ab, ba) = tokio::io::copy_bidirectional (&mut ts_active, &mut ts_uds).await?;
-            debug! ("bytes ab: {} bytes ba: {}", ab, ba);
+            ul.set_nonblocking (true)?;
+            let tl = tokio::net::TcpListener::from_std (ul)?;
+            loop {
+                match tokio::select! {
+                    _ = rx_shutdown.recv () => { Err ("Got crl-c") },
+                    rs = tl.accept () => {
+                        let (mut ts_active, _socket_address) = rs?;
+                        debug! ("tl accepted connection");
+                        let mut ts_uds = tokio::net::UnixStream::connect (socket_file_path).await?;
+                        debug! ("obtained tokio stream uds");
+                        let (ab, ba) = tokio::io::copy_bidirectional (&mut ts_active, &mut ts_uds).await?;
+                        debug! ("bytes ab: {} bytes ba: {}", ab, ba);
+                        Ok (())
+                    }
+                }
+                {
+                    Ok (_) => {},
+                    Err (e) => { debug! ("Accept loop shutdown: {:?}", e);break; }
+                }
+            }
             Result::Ok::<(), helper::PublicError> (())
         }.await
         {
@@ -293,7 +306,7 @@ fn main ()
     {
         Commands::ActivationPong => socket_activation_pong (rt.handle (), tx),
         Commands::ActivationProxyUnix { socket_file_path } => socket_activation_proxy (rt.handle (), &socket_file_path),
-        Commands::TcpProxyUnix { host, port, socket_file_path } => tcp_proxy (rt.handle (), &host, port, &socket_file_path),
+        Commands::TcpProxyUnix { host, port, socket_file_path } => tcp_proxy (rt.handle (), &host, port, &socket_file_path, tx),
         Commands::UnixPong { socket_file_path } => unix_pong (rt.handle (), &socket_file_path, tx)
     }
     debug! ("Shutting down");
